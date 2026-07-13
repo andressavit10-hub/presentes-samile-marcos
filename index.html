@@ -272,19 +272,36 @@ let newGiftDraft = { name: "", price: "", image: "" };
 let currentGiftForPurchase = null;
 let currentReservationDraft = null;
 let currentReservationId = null;
+let storageAvailable = true;
 
-/* ================= STORAGE HELPERS ================= */
+/* ================= STORAGE HELPERS (via /api/data -> Upstash Redis) ================= */
+async function kvGet(key){
+  const res = await fetch(`/api/data?key=${encodeURIComponent(key)}`);
+  if(!res.ok) throw new Error('read failed');
+  const data = await res.json();
+  return data.value;
+}
+async function kvSet(key, value){
+  const res = await fetch(`/api/data?key=${encodeURIComponent(key)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value })
+  });
+  if(!res.ok) throw new Error('write failed');
+}
 async function safeGet(key, fallback){
   try{
-    const r = await window.storage.get(key, true);
-    return r && r.value ? JSON.parse(r.value) : fallback;
+    const value = await kvGet(key);
+    storageAvailable = true;
+    return (value === null || value === undefined) ? fallback : value;
   }catch(e){
+    storageAvailable = false;
     return fallback;
   }
 }
-async function saveGifts(){ try{ await window.storage.set('gifts', JSON.stringify(gifts), true); showToast('Salvo'); }catch(e){ showToast('Erro ao salvar — tente novamente'); } }
-async function saveReservations(){ try{ await window.storage.set('reservations', JSON.stringify(reservations), true); }catch(e){ /* silent */ } }
-async function saveSettings(){ try{ await window.storage.set('settings', JSON.stringify(settings), true); showToast('Configurações salvas'); }catch(e){ showToast('Erro ao salvar'); } }
+async function saveGifts(){ try{ await kvSet('gifts', gifts); storageAvailable = true; showToast('Salvo'); }catch(e){ storageAvailable = false; showToast('Erro ao salvar — tente novamente'); } }
+async function saveReservations(){ try{ await kvSet('reservations', reservations); storageAvailable = true; }catch(e){ storageAvailable = false; } }
+async function saveSettings(){ try{ await kvSet('settings', settings); storageAvailable = true; showToast('Configurações salvas'); }catch(e){ storageAvailable = false; showToast('Erro ao salvar'); } }
 
 let toastTimer = null;
 function showToast(msg){
@@ -300,9 +317,12 @@ async function loadAll(){
   if(!gifts){ gifts = DEFAULT_GIFTS.slice(); await saveGiftsSilent(); }
   reservations = await safeGet('reservations', []);
   settings = await safeGet('settings', null);
-  if(!settings){ settings = {...DEFAULT_SETTINGS}; await window.storage.set('settings', JSON.stringify(settings), true); }
+  if(!settings){
+    settings = {...DEFAULT_SETTINGS};
+    try{ await kvSet('settings', settings); storageAvailable = true; }catch(e){ storageAvailable = false; }
+  }
 }
-async function saveGiftsSilent(){ try{ await window.storage.set('gifts', JSON.stringify(gifts), true); }catch(e){} }
+async function saveGiftsSilent(){ try{ await kvSet('gifts', gifts); storageAvailable = true; }catch(e){ storageAvailable = false; } }
 
 /* ================= UTIL ================= */
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
@@ -764,6 +784,10 @@ function setAdminTab(tab){ adminTab = tab; render(); }
 function renderAdminView(){
   return `
     <div class="admin-shell">
+      ${!storageAvailable ? `
+      <div style="background:#FBEAEA;border:1px solid #E7B9B4;color:#7A2E27;border-radius:12px;padding:14px 16px;margin-bottom:20px;font-size:13.5px;">
+        ⚠️ Não foi possível conectar ao banco de dados agora. Verifique se você criou o banco Upstash (Redis) na aba "Storage" do projeto no Vercel e se as variáveis KV_REST_API_URL e KV_REST_API_TOKEN estão configuradas. Enquanto isso, o que você alterar aqui não está sendo salvo de verdade.
+      </div>` : ''}
       <div class="admin-top">
         <h2 style="font-style:italic;">Painel dos noivos</h2>
         <div style="display:flex; gap:10px;">
