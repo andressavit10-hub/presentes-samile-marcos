@@ -473,6 +473,7 @@ function proceedToPix(){
 }
 
 function openPaymentChoiceModal(gift, reservationId, guestEmail){
+  window._currentGuestEmail = guestEmail;
   const modalRoot = document.getElementById('modal-root');
   modalRoot.innerHTML = `
     <div class="modal-overlay">
@@ -481,14 +482,15 @@ function openPaymentChoiceModal(gift, reservationId, guestEmail){
         <div class="muted">Escolha a forma de pagamento para "${escapeHtml(gift.name)}" — ${formatBRL(gift.price)}</div>
         <div class="modal-actions" style="flex-direction:column;">
           <button class="btn btn-primary" style="width:100%;margin-bottom:10px;" onclick="openPixModal(currentGiftForPurchase,'${reservationId}')">Pagar com Pix</button>
-          <button class="btn btn-ghost" style="width:100%;" onclick="startCardCheckout('${reservationId}', ${JSON.stringify(guestEmail)})">Pagar com cartão de crédito</button>
+          <button class="btn btn-ghost" style="width:100%;" onclick="startCardCheckout('${reservationId}')">Pagar com cartão de crédito</button>
         </div>
       </div>
     </div>
   `;
 }
 
-async function startCardCheckout(reservationId, guestEmail){
+async function startCardCheckout(reservationId){
+  const guestEmail = window._currentGuestEmail;
   const modalRoot = document.getElementById('modal-root');
   modalRoot.innerHTML = `
     <div class="modal-overlay">
