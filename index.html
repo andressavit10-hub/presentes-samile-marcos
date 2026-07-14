@@ -469,7 +469,64 @@ function proceedToPix(){
   reservations.push(reservation);
   currentReservationId = reservation.id;
   saveReservations();
-  openPixModal(currentGiftForPurchase, reservation.id);
+  openPaymentChoiceModal(currentGiftForPurchase, reservation.id, email);
+}
+
+function openPaymentChoiceModal(gift, reservationId, guestEmail){
+  const modalRoot = document.getElementById('modal-root');
+  modalRoot.innerHTML = `
+    <div class="modal-overlay">
+      <div class="modal">
+        <h2>Como você prefere pagar?</h2>
+        <div class="muted">Escolha a forma de pagamento para "${escapeHtml(gift.name)}" — ${formatBRL(gift.price)}</div>
+        <div class="modal-actions" style="flex-direction:column;">
+          <button class="btn btn-primary" style="width:100%;margin-bottom:10px;" onclick="openPixModal(currentGiftForPurchase,'${reservationId}')">Pagar com Pix</button>
+          <button class="btn btn-ghost" style="width:100%;" onclick="startCardCheckout('${reservationId}', ${JSON.stringify(guestEmail)})">Pagar com cartão de crédito</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function startCardCheckout(reservationId, guestEmail){
+  const modalRoot = document.getElementById('modal-root');
+  modalRoot.innerHTML = `
+    <div class="modal-overlay">
+      <div class="modal" style="text-align:center;">
+        <div class="muted">Preparando pagamento seguro...</div>
+      </div>
+    </div>
+  `;
+  try{
+    const res = await fetch('/api/create-preference', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        reservationId,
+        giftName: currentGiftForPurchase.name,
+        amount: currentGiftForPurchase.price,
+        guestEmail
+      })
+    });
+    const data = await res.json();
+    if(!res.ok || !data.init_point){
+      throw new Error(data.error || 'falha ao criar pagamento');
+    }
+    window.location.href = data.init_point;
+  }catch(e){
+    modalRoot.innerHTML = `
+      <div class="modal-overlay">
+        <div class="modal" style="text-align:center;">
+          <h2>Não foi possível iniciar o pagamento</h2>
+          <div class="muted">Tente novamente em instantes, ou pague via Pix.</div>
+          <div class="modal-actions">
+            <button class="btn btn-ghost" onclick="closeModal()">Fechar</button>
+            <button class="btn btn-primary" onclick="openPixModal(currentGiftForPurchase,'${reservationId}')">Pagar com Pix</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
 }
 
 function openPixModal(gift, reservationId){
@@ -715,6 +772,7 @@ function renderAdminReservationsTab(){
       <td>${escapeHtml(r.guestName)}<br><span style="color:var(--text-soft);font-size:12px;">${escapeHtml(r.guestEmail)}</span></td>
       <td>${escapeHtml(r.giftName)}</td>
       <td>${formatBRL(r.amount)}</td>
+      <td>${r.paymentMethod === 'cartao' ? 'Cartão' : 'Pix'}</td>
       <td><span class="status-pill ${r.status}">${r.status === 'confirmado' ? 'Confirmado' : 'Aguardando'}</span></td>
       <td class="msg-cell">${escapeHtml(r.message) || '<span style="color:var(--text-soft);">—</span>'}</td>
       <td style="font-size:12px;color:var(--text-soft);">${new Date(r.timestamp).toLocaleString('pt-BR')}</td>
@@ -725,7 +783,7 @@ function renderAdminReservationsTab(){
       <h3>Reservas e mensagens</h3>
       <div style="overflow-x:auto;">
         <table class="res-table">
-          <thead><tr><th>Convidado</th><th>Presente</th><th>Valor</th><th>Status</th><th>Mensagem</th><th>Data</th></tr></thead>
+          <thead><tr><th>Convidado</th><th>Presente</th><th>Valor</th><th>Forma</th><th>Status</th><th>Mensagem</th><th>Data</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
@@ -817,12 +875,48 @@ function render(){
   }
 }
 
+/* ================= MERCADO PAGO RETURN HANDLING ================= */
+function handleMpReturn(){
+  const params = new URLSearchParams(window.location.search);
+  const status = params.get('pagamento');
+  if(!status) return;
+
+  if(status === 'sucesso'){
+    openThanksModal();
+  }else if(status === 'pendente'){
+    const modalRoot = document.getElementById('modal-root');
+    modalRoot.innerHTML = `
+      <div class="modal-overlay">
+        <div class="modal" style="text-align:center;">
+          <h2>Pagamento em análise</h2>
+          <div class="muted">Assim que for aprovado, seu presente será confirmado automaticamente. Obrigado pelo carinho!</div>
+          <div class="modal-actions"><button class="btn btn-primary" style="flex:none;padding:12px 32px;" onclick="closeModal()">Fechar</button></div>
+        </div>
+      </div>
+    `;
+  }else if(status === 'falha'){
+    const modalRoot = document.getElementById('modal-root');
+    modalRoot.innerHTML = `
+      <div class="modal-overlay">
+        <div class="modal" style="text-align:center;">
+          <h2>Pagamento não concluído</h2>
+          <div class="muted">Não foi possível confirmar o pagamento com cartão. Você pode tentar novamente ou usar o Pix.</div>
+          <div class="modal-actions"><button class="btn btn-primary" style="flex:none;padding:12px 32px;" onclick="closeModal()">Fechar</button></div>
+        </div>
+      </div>
+    `;
+  }
+  // clean the URL so refreshing doesn't reopen the modal
+  window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+}
+
 /* ================= INIT ================= */
 (async function init(){
   document.getElementById('app').innerHTML = '<div style="text-align:center;padding:100px 20px;color:#8A7680;">Carregando...</div>';
   await loadAll();
   render();
   if(window.location.hash === '#admin'){ openAdminLogin(); }
+  handleMpReturn();
 })();
 </script>
 </body>
