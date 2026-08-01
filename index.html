@@ -274,6 +274,52 @@ let currentReservationDraft = null;
 let currentReservationId = null;
 let storageAvailable = true;
 
+/* ================= GIFT IMAGE STORAGE (chave própria por presente) =================
+   Antes, toda foto ficava embutida dentro do array salvo na chave única 'gifts',
+   então CADA salvamento reenviava TODAS as fotos de TODOS os presentes juntas —
+   isso cresce sem limite e acaba estourando o tamanho máximo aceito (erro 413).
+   Agora cada foto vive na sua própria chave ('gift-img-<id>'), então salvar um
+   presente nunca depende do tamanho da lista inteira. */
+let migratedImageIds = new Set(); // ids cuja foto já está confirmadamente salva em chave própria
+
+function giftsForStorage(){
+  // Só remove a foto do payload da lista quando já sabemos que ela está salva
+  // em separado — assim nenhuma foto antiga é perdida antes de ser migrada.
+  return gifts.map(g => {
+    if(migratedImageIds.has(g.id)){
+      const { image, ...rest } = g;
+      return rest;
+    }
+    return g;
+  });
+}
+async function saveGiftImage(id, dataUrl){
+  try{ await kvSet('gift-img-' + id, dataUrl); storageAvailable = true; return true; }
+  catch(e){ storageAvailable = false; return false; }
+}
+async function migrateLegacyImages(){
+  let anyMigrated = false;
+  await Promise.all(gifts.map(async (g) => {
+    if(migratedImageIds.has(g.id)) return;
+    if(!g.image || g.image === PLACEHOLDER_IMG) return;
+    try{
+      const existing = await safeGet('gift-img-' + g.id, null);
+      if(existing){
+        g.image = existing;
+        migratedImageIds.add(g.id);
+        anyMigrated = true;
+        return;
+      }
+    }catch(e){ /* segue para tentar migrar abaixo */ }
+    if(typeof g.image === 'string' && g.image.startsWith('data:')){
+      const ok = await saveGiftImage(g.id, g.image);
+      if(ok){ migratedImageIds.add(g.id); anyMigrated = true; }
+      // se falhar, a foto continua embutida na lista (nada é perdido)
+    }
+  }));
+  return anyMigrated;
+}
+
 /* ================= STORAGE HELPERS (via /api/data -> Upstash Redis) ================= */
 async function kvGet(key){
   const res = await fetch(`/api/data?key=${encodeURIComponent(key)}`);
@@ -299,7 +345,8 @@ async function safeGet(key, fallback){
     return fallback;
   }
 }
-async function saveGifts(){ try{ await kvSet('gifts', gifts); storageAvailable = true; showToast('Salvo'); }catch(e){ storageAvailable = false; showToast('Erro ao salvar — tente novamente', 3500); } }
+async function saveGifts(){ try{ await kvSet('gifts', giftsForStorage()); storageAvailable = true; showToast('Salvo'); }catch(e){ storageAvailable = false; showToast('Erro ao salvar — tente novamente', 3500); } }
+async function saveGiftsSilent(){ try{ await kvSet('gifts', giftsForStorage()); storageAvailable = true; }catch(e){ storageAvailable = false; } }
 async function saveReservations(){ try{ await kvSet('reservations', reservations); storageAvailable = true; }catch(e){ storageAvailable = false; } }
 async function saveSettings(){ try{ await kvSet('settings', settings); storageAvailable = true; showToast('Configurações salvas'); }catch(e){ storageAvailable = false; showToast('Erro ao salvar'); } }
 
@@ -314,10 +361,10 @@ function showToast(msg, duration = 1400){
 
 /* ================= IMAGE COMPRESSION ================= */
 // Fotos de celular podem ter vários MB — em base64 isso facilmente ultrapassa
-// o limite de tamanho do armazenamento (Upstash/Vercel KV) e a gravação falha
-// silenciosamente. Aqui a imagem é redimensionada e recomprimida no navegador
-// antes de virar base64, ficando tipicamente com 50–150KB.
-function compressImage(file, maxDim = 900, quality = 0.72){
+// o limite de tamanho aceito pelo endpoint /api/data (Vercel/Upstash). Aqui a
+// imagem é redimensionada e recomprimida no navegador, reduzindo a qualidade
+// progressivamente até o resultado ficar bem pequeno (alvo: ~120KB em base64).
+function loadImageFromFile(file){
   return new Promise((resolve, reject) => {
     if(!file.type || !file.type.startsWith('image/')){
       reject(new Error('not-an-image'));
@@ -328,35 +375,64 @@ function compressImage(file, maxDim = 900, quality = 0.72){
     reader.onload = (e) => {
       const img = new Image();
       img.onerror = () => reject(new Error('decode-failed'));
-      img.onload = () => {
-        let { width, height } = img;
-        if(width > height && width > maxDim){
-          height = Math.round(height * (maxDim / width));
-          width = maxDim;
-        }else if(height >= width && height > maxDim){
-          width = Math.round(width * (maxDim / height));
-          height = maxDim;
-        }
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0, width, height);
-        try{
-          resolve(canvas.toDataURL('image/jpeg', quality));
-        }catch(err){
-          reject(err);
-        }
-      };
+      img.onload = () => resolve(img);
       img.src = e.target.result;
     };
     reader.readAsDataURL(file);
   });
 }
+function drawToDataUrl(img, maxDim, quality){
+  let { width, height } = img;
+  if(width > height && width > maxDim){
+    height = Math.round(height * (maxDim / width));
+    width = maxDim;
+  }else if(height >= width && height > maxDim){
+    width = Math.round(width * (maxDim / height));
+    height = maxDim;
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, width, height);
+  return canvas.toDataURL('image/jpeg', quality);
+}
+async function compressImage(file){
+  const img = await loadImageFromFile(file);
+  const TARGET_BYTES = 120 * 1024; // ~120KB em base64
+  // Tenta combinações decrescentes de tamanho/qualidade até caber no alvo.
+  const attempts = [
+    [900, 0.72], [700, 0.65], [500, 0.6], [360, 0.55], [260, 0.5]
+  ];
+  let result = null;
+  for(const [maxDim, quality] of attempts){
+    const dataUrl = drawToDataUrl(img, maxDim, quality);
+    result = dataUrl;
+    if(dataUrl.length <= TARGET_BYTES) break;
+  }
+  return result;
+}
 
 async function loadAll(){
   gifts = await safeGet('gifts', null);
   if(!gifts){ gifts = DEFAULT_GIFTS.slice(); await saveGiftsSilent(); }
+  // Presentes editados sob o novo sistema não têm mais a foto embutida na
+  // lista — buscamos a foto na chave própria dele.
+  await Promise.all(gifts.map(async (g) => {
+    if(!g.image){
+      try{
+        const img = await safeGet('gift-img-' + g.id, null);
+        g.image = img || PLACEHOLDER_IMG;
+        if(img) migratedImageIds.add(g.id);
+      }catch(e){
+        g.image = PLACEHOLDER_IMG;
+      }
+    }
+  }));
+  // Migra fotos antigas (ainda embutidas na lista) para chaves próprias, sem
+  // apagar nada caso a migração de alguma falhe.
+  const migrated = await migrateLegacyImages();
+  if(migrated) await saveGiftsSilent();
   reservations = await safeGet('reservations', []);
   settings = await safeGet('settings', null);
   if(!settings){
@@ -364,7 +440,6 @@ async function loadAll(){
     try{ await kvSet('settings', settings); storageAvailable = true; }catch(e){ storageAvailable = false; }
   }
 }
-async function saveGiftsSilent(){ try{ await kvSet('gifts', gifts); storageAvailable = true; }catch(e){ storageAvailable = false; } }
 
 /* ================= UTIL ================= */
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
@@ -752,7 +827,13 @@ async function handleGiftImageChange(id, inputEl){
   try{
     const dataUrl = await compressImage(file);
     const g = gifts.find(x=>x.id===id);
-    if(g){ g.image = dataUrl; await saveGifts(); renderAdminBody(); }
+    if(!g) return;
+    g.image = dataUrl;
+    renderAdminBody();
+    const ok = await saveGiftImage(id, dataUrl);
+    if(ok) migratedImageIds.add(id);
+    await saveGifts(); // agora consegue enviar a lista sem embutir a foto
+    if(!ok) showToast('Erro ao salvar a foto — tente novamente', 3500);
   }catch(e){
     showToast('Não foi possível usar essa foto — tente outra imagem', 3000);
   }
@@ -771,23 +852,23 @@ async function handleNewGiftImage(inputEl){
   }
 }
 
-function addNewGift(){
+async function addNewGift(){
   const name = (newGiftDraft.name||'').trim();
   const price = parseFloat(newGiftDraft.price);
   if(!name || isNaN(price) || price <= 0){
     showToast('Preencha nome e valor válidos');
     return;
   }
-  gifts.push({
-    id: uid(),
-    name,
-    price,
-    image: newGiftDraft.image || PLACEHOLDER_IMG,
-    order: gifts.length
-  });
+  const id = uid();
+  const image = newGiftDraft.image || PLACEHOLDER_IMG;
+  gifts.push({ id, name, price, image, order: gifts.length });
   newGiftDraft = { name: "", price: "", image: "" };
-  saveGifts();
   renderAdminBody();
+  if(image !== PLACEHOLDER_IMG){
+    const ok = await saveGiftImage(id, image);
+    if(ok) migratedImageIds.add(id);
+  }
+  await saveGifts();
 }
 
 function moveGift(id, direction){
@@ -802,11 +883,13 @@ function moveGift(id, direction){
   renderAdminBody();
 }
 
-function removeGift(id){
+async function removeGift(id){
   if(!confirm('Remover este presente da lista? Esta ação não pode ser desfeita.')) return;
   gifts = gifts.filter(g=>g.id!==id);
-  saveGifts();
+  migratedImageIds.delete(id);
   renderAdminBody();
+  await saveGifts();
+  try{ await kvSet('gift-img-' + id, null); }catch(e){ /* best-effort */ }
 }
 
 /* ================= ADMIN: RESERVATIONS TAB ================= */
