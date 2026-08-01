@@ -299,17 +299,59 @@ async function safeGet(key, fallback){
     return fallback;
   }
 }
-async function saveGifts(){ try{ await kvSet('gifts', gifts); storageAvailable = true; showToast('Salvo'); }catch(e){ storageAvailable = false; showToast('Erro ao salvar — tente novamente'); } }
+async function saveGifts(){ try{ await kvSet('gifts', gifts); storageAvailable = true; showToast('Salvo'); }catch(e){ storageAvailable = false; showToast('Erro ao salvar — tente novamente', 3500); } }
 async function saveReservations(){ try{ await kvSet('reservations', reservations); storageAvailable = true; }catch(e){ storageAvailable = false; } }
 async function saveSettings(){ try{ await kvSet('settings', settings); storageAvailable = true; showToast('Configurações salvas'); }catch(e){ storageAvailable = false; showToast('Erro ao salvar'); } }
 
 let toastTimer = null;
-function showToast(msg){
+function showToast(msg, duration = 1400){
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(()=> t.classList.remove('show'), 1400);
+  toastTimer = setTimeout(()=> t.classList.remove('show'), duration);
+}
+
+/* ================= IMAGE COMPRESSION ================= */
+// Fotos de celular podem ter vários MB — em base64 isso facilmente ultrapassa
+// o limite de tamanho do armazenamento (Upstash/Vercel KV) e a gravação falha
+// silenciosamente. Aqui a imagem é redimensionada e recomprimida no navegador
+// antes de virar base64, ficando tipicamente com 50–150KB.
+function compressImage(file, maxDim = 900, quality = 0.72){
+  return new Promise((resolve, reject) => {
+    if(!file.type || !file.type.startsWith('image/')){
+      reject(new Error('not-an-image'));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('read-failed'));
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('decode-failed'));
+      img.onload = () => {
+        let { width, height } = img;
+        if(width > height && width > maxDim){
+          height = Math.round(height * (maxDim / width));
+          width = maxDim;
+        }else if(height >= width && height > maxDim){
+          width = Math.round(width * (maxDim / height));
+          height = maxDim;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        try{
+          resolve(canvas.toDataURL('image/jpeg', quality));
+        }catch(err){
+          reject(err);
+        }
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 async function loadAll(){
@@ -703,26 +745,30 @@ function updateGiftField(id, field, value){
   window._giftSaveTimer = setTimeout(()=>{ saveGifts(); renderAdminBody(); }, 500);
 }
 
-function handleGiftImageChange(id, inputEl){
+async function handleGiftImageChange(id, inputEl){
   const file = inputEl.files[0];
   if(!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
+  showToast('Processando foto...', 4000);
+  try{
+    const dataUrl = await compressImage(file);
     const g = gifts.find(x=>x.id===id);
-    if(g){ g.image = e.target.result; saveGifts(); renderAdminBody(); }
-  };
-  reader.readAsDataURL(file);
+    if(g){ g.image = dataUrl; await saveGifts(); renderAdminBody(); }
+  }catch(e){
+    showToast('Não foi possível usar essa foto — tente outra imagem', 3000);
+  }
 }
 
-function handleNewGiftImage(inputEl){
+async function handleNewGiftImage(inputEl){
   const file = inputEl.files[0];
   if(!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    newGiftDraft.image = e.target.result;
+  showToast('Processando foto...', 4000);
+  try{
+    newGiftDraft.image = await compressImage(file);
     renderAdminBody();
-  };
-  reader.readAsDataURL(file);
+    showToast('Foto pronta', 1400);
+  }catch(e){
+    showToast('Não foi possível usar essa foto — tente outra imagem', 3000);
+  }
 }
 
 function addNewGift(){
