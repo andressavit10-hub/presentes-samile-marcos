@@ -302,15 +302,13 @@ async function migrateLegacyImages(){
   await Promise.all(gifts.map(async (g) => {
     if(migratedImageIds.has(g.id)) return;
     if(!g.image || g.image === PLACEHOLDER_IMG) return;
-    try{
-      const existing = await safeGet('gift-img-' + g.id, null);
-      if(existing){
-        g.image = existing;
-        migratedImageIds.add(g.id);
-        anyMigrated = true;
-        return;
-      }
-    }catch(e){ /* segue para tentar migrar abaixo */ }
+    const existingResult = await safeGet('gift-img-' + g.id, null);
+    if(existingResult.value){
+      g.image = existingResult.value;
+      migratedImageIds.add(g.id);
+      anyMigrated = true;
+      return;
+    }
     if(typeof g.image === 'string' && g.image.startsWith('data:')){
       const ok = await saveGiftImage(g.id, g.image);
       if(ok){ migratedImageIds.add(g.id); anyMigrated = true; }
@@ -339,10 +337,10 @@ async function safeGet(key, fallback){
   try{
     const value = await kvGet(key);
     storageAvailable = true;
-    return (value === null || value === undefined) ? fallback : value;
+    return { ok: true, value: (value === null || value === undefined) ? fallback : value };
   }catch(e){
     storageAvailable = false;
-    return fallback;
+    return { ok: false, value: fallback };
   }
 }
 async function saveGifts(){ try{ await kvSet('gifts', giftsForStorage()); storageAvailable = true; showToast('Salvo'); }catch(e){ storageAvailable = false; showToast('Erro ao salvar — tente novamente', 3500); } }
@@ -414,30 +412,41 @@ async function compressImage(file){
 }
 
 async function loadAll(){
-  gifts = await safeGet('gifts', null);
-  if(!gifts){ gifts = DEFAULT_GIFTS.slice(); await saveGiftsSilent(); }
+  const giftsResult = await safeGet('gifts', null);
+  if(giftsResult.ok){
+    // Leitura confirmada: só grava a lista padrão se o banco realmente
+    // não tinha nada salvo. Se já existia algo (mesmo vazio "[]" não seria
+    // o caso aqui, pois value===null só ocorre quando a chave não existe),
+    // respeitamos o que está lá.
+    gifts = giftsResult.value || DEFAULT_GIFTS.slice();
+    if(!giftsResult.value) await saveGiftsSilent();
+  } else {
+    // Falha de leitura (rede instável, erro temporário, etc.): NUNCA sobrescrevemos
+    // o banco aqui. Mostramos os padrões só nesta sessão, como modo de segurança,
+    // e o aviso de "não foi possível conectar" fica ativo (storageAvailable=false).
+    gifts = DEFAULT_GIFTS.slice();
+  }
   // Presentes editados sob o novo sistema não têm mais a foto embutida na
   // lista — buscamos a foto na chave própria dele.
   await Promise.all(gifts.map(async (g) => {
     if(!g.image){
-      try{
-        const img = await safeGet('gift-img-' + g.id, null);
-        g.image = img || PLACEHOLDER_IMG;
-        if(img) migratedImageIds.add(g.id);
-      }catch(e){
-        g.image = PLACEHOLDER_IMG;
-      }
+      const imgResult = await safeGet('gift-img-' + g.id, null);
+      g.image = imgResult.value || PLACEHOLDER_IMG;
+      if(imgResult.ok && imgResult.value) migratedImageIds.add(g.id);
     }
   }));
   // Migra fotos antigas (ainda embutidas na lista) para chaves próprias, sem
   // apagar nada caso a migração de alguma falhe.
-  const migrated = await migrateLegacyImages();
+  const migrated = giftsResult.ok ? await migrateLegacyImages() : false;
   if(migrated) await saveGiftsSilent();
-  reservations = await safeGet('reservations', []);
-  settings = await safeGet('settings', null);
-  if(!settings){
+  const reservationsResult = await safeGet('reservations', []);
+  reservations = reservationsResult.value;
+  const settingsResult = await safeGet('settings', null);
+  if(settingsResult.ok && !settingsResult.value){
     settings = {...DEFAULT_SETTINGS};
     try{ await kvSet('settings', settings); storageAvailable = true; }catch(e){ storageAvailable = false; }
+  } else {
+    settings = settingsResult.value || {...DEFAULT_SETTINGS};
   }
 }
 
@@ -950,7 +959,59 @@ function renderAdminSettingsTab(){
         Atenção: esta é uma senha simples de proteção do painel — adequada para uso familiar, mas não é um sistema de segurança robusto. Evite reutilizar uma senha sensível aqui.
       </div>
     </div>
+    <div class="panel">
+      <h3>Backup dos presentes</h3>
+      <div class="muted" style="margin-bottom:14px;">
+        Baixe um arquivo com a lista atual de presentes e reservas. Guarde esse arquivo de vez em quando (ex: depois de cadastrar vários presentes) — se algo der errado, você pode restaurar a partir dele.
+      </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-sage" style="flex:none;padding:10px 18px;" onclick="exportBackup()">Baixar backup agora</button>
+        <label class="btn btn-ghost" style="flex:none;padding:10px 18px;margin:0;">
+          Restaurar de um backup
+          <input type="file" accept="application/json" style="display:none;" onchange="importBackup(event)">
+        </label>
+      </div>
+    </div>
   `;
+}
+async function exportBackup(){
+  const backup = {
+    exportedAt: new Date().toISOString(),
+    gifts: giftsForStorage(),
+    reservations,
+    settings
+  };
+  const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `backup-presentes-${new Date().toISOString().slice(0,10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+async function importBackup(event){
+  const file = event.target.files[0];
+  if(!file) return;
+  try{
+    const text = await file.text();
+    const backup = JSON.parse(text);
+    if(!Array.isArray(backup.gifts)) throw new Error('arquivo inválido');
+    if(!confirm(`Isso vai substituir a lista atual de presentes (${gifts.length} itens) pelos ${backup.gifts.length} itens do backup. Continuar?`)) return;
+    gifts = backup.gifts;
+    if(Array.isArray(backup.reservations)) reservations = backup.reservations;
+    if(backup.settings) settings = backup.settings;
+    await saveGifts();
+    await saveReservations();
+    await saveSettings();
+    renderAdminBody();
+    showToast('Backup restaurado');
+  }catch(e){
+    alert('Não foi possível ler esse arquivo de backup.');
+  } finally {
+    event.target.value = '';
+  }
 }
 function saveSettingsForm(){
   settings.pixKey = document.getElementById('set-pixkey').value.trim();
